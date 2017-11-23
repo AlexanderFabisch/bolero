@@ -121,7 +121,6 @@ class CCMAESOptimizer(ContextualOptimizer):
                 4 + int(3 * np.log(self.n_total_dims)) *
                 (1 + 2 * n_context_dims))
 
-        # TODO don't know if n_params or n_total_dims
         self.hsig_threshold = 2 + 4.0 / (self.n_params + 1)
 
         self.history_theta = deque(maxlen=self.n_samples_per_update)
@@ -162,7 +161,8 @@ class CCMAESOptimizer(ContextualOptimizer):
 
         self.weights = np.empty(self.n_samples_per_update)
 
-        self.reward_model = Ridge(alpha=self.gamma, fit_intercept=False)
+        self.reward_model = Ridge(alpha=self.gamma, fit_intercept=False,
+                                  normalize=True)
 
         self.invsqrtC = inv_sqrt(self.cov)[0]
         self.eigen_decomp_updated = self.it
@@ -248,7 +248,17 @@ class CCMAESOptimizer(ContextualOptimizer):
         last_mean_theta = self.policy_.policy(mean_phi, explore=False)
         last_mean_thetas = phi_s.dot(self.policy_.W.T)
 
-        self.policy_.fit(phi_s, theta, self.weights, context_transform=False)
+        D = np.diag(self.weights)
+        X = phi_s# - mean_phi
+        #std_X = X.std(axis=0)
+        #std_X[std_X == 0] = 1.0
+        #X /= std_X
+        W = np.linalg.pinv(X.T.dot(D).dot(X) + np.eye(X.shape[1]) *
+                           self.gamma).dot(X.T).dot(D).dot(theta).T
+        #W /= std_X
+        #W[-1, :] -= mean_phi # TODO correct place?
+        self.policy_.W = W
+        #self.policy_.fit(phi_s, theta, self.weights, context_transform=False)
 
         mean_theta = self.policy_.policy(mean_phi, explore=False)
         sigma = np.sqrt(self.var)
