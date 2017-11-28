@@ -11,6 +11,42 @@ from .cmaes import inv_sqrt
 from sklearn.linear_model import Ridge
 
 
+def regression(X, Y, sample_weight=None, normalize=True, gamma=1e-10):
+    n_samples = X.shape[0]
+
+    if sample_weight is None:
+        sample_weight = np.ones((n_samples, 1))
+    else:
+        sample_weight = sample_weight.reshape(n_samples, 1).astype(np.float)
+    sample_weight = sample_weight / np.sum(sample_weight)
+
+    X_std = np.std(X, axis=0)
+    X_std[X_std == 0] = 1.0
+    if normalize:
+        X_mean = np.mean(X, axis=0);
+        X = (X - X_mean) / X_std
+
+    valid = X_std != 0
+    valid_input_data = X[:, valid]
+    if valid_input_data.ndim == 1:
+        valid_input_data = valid_input_data[:, np.newaxis]
+
+    Shat = np.hstack([np.ones((n_samples, 1)), valid_input_data])
+    SW = Shat * sample_weight
+    Gamma = gamma * np.diag(np.hstack(((0,), np.ones(SW.shape[1] - 1))))
+    W = np.linalg.pinv(SW.T.dot(Shat) + Gamma).dot(SW.T).dot(Y)
+
+    bias = W[0]
+    weights = np.zeros((Y.shape[1], X.shape[1]))
+    weights[:, valid] = W[1:].T
+
+    if normalize:
+        weights = weights / X_std
+        bias -= weights.dot(X_mean)
+
+    return weights, bias
+
+
 class CCMAESOptimizer(ContextualOptimizer):
     """Contextual Covariance Matrix Adaptation Evolution Strategy.
 
@@ -162,8 +198,6 @@ class CCMAESOptimizer(ContextualOptimizer):
 
         self.weights = np.empty(self.n_samples_per_update)
 
-        self.reward_model = Ridge(alpha=self.gamma, fit_intercept=False)
-
         self.invsqrtC = inv_sqrt(self.cov)[0]
         self.eigen_decomp_updated = self.it
         self.eigen_update_freq = (self.n_samples_per_update /
@@ -234,8 +268,9 @@ class CCMAESOptimizer(ContextualOptimizer):
         theta = np.asarray(self.history_theta)
         R = np.asarray(self.history_R)
 
-        self.reward_model.fit(phi_s, R)
-        advantages = R - self.reward_model.predict(phi_s)
+        advantage_weights, _ = regression(
+            phi_s, R[:, np.newaxis], gamma=self.gamma)
+        advantages = R - phi_s.dot(advantage_weights.T)[:, 0]
         indices = np.argsort(np.argsort(advantages)[::-1])
 
         self.weights = self.ordered_weights[indices]
@@ -248,7 +283,12 @@ class CCMAESOptimizer(ContextualOptimizer):
         last_mean_theta = self.policy_.policy(mean_phi, explore=False)
         last_mean_thetas = phi_s.dot(self.policy_.W.T)
 
-        self.policy_.fit(phi_s, theta, self.weights, context_transform=False)
+        weights, bias = regression(phi_s, theta, self.weights, gamma=self.gamma)
+        self.policy_.W[:, :] = weights
+        self.policy_.W[:, -1] = bias
+        print("ERROR")
+        print(np.mean((theta - phi_s.dot(self.policy_.W.T)) ** 2 * self.weights[:, np.newaxis]))
+        #self.policy_.fit(phi_s, theta, self.weights, context_transform=False)
 
         mean_theta = self.policy_.policy(mean_phi, explore=False)
         sigma = np.sqrt(self.var)
