@@ -21,6 +21,7 @@ from .gen_rst import generate_dir_rst, SPHX_GLR_SIG
 from .docs_resolv import embed_code_links
 from .downloads import generate_zipfiles
 from .sorting import NumberOfCodeLinesSortKey
+from .binder import copy_binder_reqs, check_binder_conf
 
 try:
     FileNotFoundError
@@ -30,6 +31,7 @@ except NameError:
 
 DEFAULT_GALLERY_CONF = {
     'filename_pattern': re.escape(os.sep) + 'plot',
+    'ignore_pattern': '__init__\.py',
     'examples_dirs': os.path.join('..', 'examples'),
     'subsection_order': None,
     'within_subsection_order': NumberOfCodeLinesSortKey,
@@ -49,6 +51,7 @@ DEFAULT_GALLERY_CONF = {
     'expected_failing_examples': set(),
     'thumbnail_size': (400, 280),  # Default CSS does 0.4 scaling (160, 112)
     'min_reported_time': 0,
+    'binder': {},
 }
 
 logger = sphinx_compatibility.getLogger('sphinx-gallery')
@@ -93,44 +96,18 @@ def parse_config(app):
         abort_on_example_error=app.builder.config.abort_on_example_error)
     gallery_conf['src_dir'] = app.builder.srcdir
 
-    backreferences_warning = """\n========
-Sphinx-Gallery now requires you to set the configuration variable
-'backreferences_dir' in your config to activate the
-backreferences. That is mini galleries clustered by the functions used
-in the example scripts. Have a look at it in sphinx-gallery
-
-https://sphinx-gallery.readthedocs.io/en/stable/index.html#examples-using-numpy-linspace
-"""
-
     if gallery_conf.get("mod_example_dir", False):
-        update_msg = """\nFor a quick fix try replacing 'mod_example_dir'
-by 'backreferences_dir' in your conf.py file. If that does not solve the
-present issue read carefully how to update in the online documentation
+        backreferences_warning = """\n========
+        Sphinx-Gallery found the configuration key 'mod_example_dir'. This
+        is deprecated, and you should now use the key 'backreferences_dir'
+        instead. Support for 'mod_example_dir' will be removed in a subsequent
+        version of Sphinx-Gallery. For more details, see the backreferences
+        documentation:
 
-https://sphinx-gallery.readthedocs.io/en/latest/advanced_configuration.html#references-to-examples"""
-
+        https://sphinx-gallery.readthedocs.io/en/latest/advanced_configuration.html#references-to-examples"""
         gallery_conf['backreferences_dir'] = gallery_conf['mod_example_dir']
         logger.warning(
-            "Old configuration for backreferences detected \n"
-            "using the configuration variable `mod_example_dir`\n"
-            "%s%s",
             backreferences_warning,
-            update_msg,
-            type=DeprecationWarning)
-
-    elif gallery_conf['backreferences_dir'] is None:
-        no_care_msg = """
-If you don't care about this features set in your conf.py
-'backreferences_dir': False\n"""
-
-        logger.warning(backreferences_warning + no_care_msg)
-
-        gallery_conf['backreferences_dir'] = os.path.join(
-            'modules', 'generated')
-        logger.warning(
-            "Using old default 'backreferences_dir':'%s'.\n"
-            "This will be disabled in future releases\n",
-            gallery_conf['backreferences_dir'],
             type=DeprecationWarning)
 
     # this assures I can call the config in other places
@@ -190,7 +167,7 @@ def _prepare_sphx_glr_dirs(gallery_conf, srcdir):
         if not os.path.exists(backreferences_dir):
             os.makedirs(backreferences_dir)
 
-    return zip(examples_dirs, gallery_dirs)
+    return list(zip(examples_dirs, gallery_dirs))
 
 
 def generate_gallery_rst(app):
@@ -209,6 +186,11 @@ def generate_gallery_rst(app):
     computation_times = []
     workdirs = _prepare_sphx_glr_dirs(gallery_conf,
                                       app.builder.srcdir)
+
+    # Check for duplicate filenames to make sure linking works as expected
+    examples_dirs = [ex_dir for ex_dir, _ in workdirs]
+    files = collect_gallery_files(examples_dirs)
+    check_duplicate_filenames(files)
 
     for examples_dir, gallery_dir in workdirs:
 
@@ -257,6 +239,12 @@ def generate_gallery_rst(app):
                     logger.info("\t- %s: %.2g sec", fname, time_elapsed)
             else:
                 logger.info("\t- %s: not run", fname)
+
+    # Copy the requirements files for binder
+    binder_conf = check_binder_conf(gallery_conf.get('binder'))
+    if len(binder_conf) > 0:
+        logger.info("copying binder requirements...")
+        copy_binder_reqs(app)
 
 
 def touch_empty_backreferences(app, what, name, obj, options, lines):
@@ -317,7 +305,7 @@ def sumarize_failing_examples(app, exception):
     examples_not_expected_to_pass = expected_failing_examples.difference(
         failing_examples)
     if examples_not_expected_to_pass:
-        fail_msgs.append("Examples expected to fail, but not failling:\n" +
+        fail_msgs.append("Examples expected to fail, but not failing:\n" +
                          "Please remove these examples from\n" +
                          "sphinx_gallery_conf['expected_failing_examples']\n" +
                          "in your conf.py file"
@@ -327,6 +315,36 @@ def sumarize_failing_examples(app, exception):
         raise ValueError("Here is a summary of the problems encountered when "
                          "running the examples\n\n" + "\n".join(fail_msgs) +
                          "\n" + "-" * 79)
+
+
+def collect_gallery_files(examples_dirs):
+    """Collect python files from the gallery example directories."""
+    files = []
+    for example_dir in examples_dirs:
+        for root, dirnames, filenames in os.walk(example_dir):
+            for filename in filenames:
+                if filename.endswith('.py'):
+                    files.append(os.path.join(root, filename))
+    return files
+
+
+def check_duplicate_filenames(files):
+    """Check for duplicate filenames across gallery directories."""
+    # Check whether we'll have duplicates
+    used_names = set()
+    dup_names = list()
+
+    for this_file in files:
+        this_fname = os.path.basename(this_file)
+        if this_fname in used_names:
+            dup_names.append(this_file)
+        else:
+            used_names.add(this_fname)
+
+    if len(dup_names) > 0:
+        logger.warning(
+            'Duplicate file name(s) found. Having duplicate file names will '
+            'break some links. List of files: {}'.format(sorted(dup_names),))
 
 
 def get_default_config_value(key):

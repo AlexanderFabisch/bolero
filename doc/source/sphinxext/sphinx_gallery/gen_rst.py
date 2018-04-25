@@ -24,7 +24,10 @@ import shutil
 import subprocess
 import sys
 import traceback
+import codeop
 from distutils.version import LooseVersion
+
+from .utils import replace_py_ipynb
 
 
 # Try Python 2 first, otherwise load from Python 3
@@ -80,6 +83,7 @@ from .downloads import CODE_DOWNLOAD
 from .py_source_parser import split_code_and_text_blocks
 
 from .notebook import jupyter_notebook, save_notebook
+from .binder import check_binder_conf, copy_binder_reqs, gen_binder_rst
 
 try:
     basestring
@@ -91,6 +95,48 @@ logger = sphinx_compatibility.getLogger('sphinx-gallery')
 
 
 ###############################################################################
+
+
+class LoggingTee(object):
+    """A tee object to redirect streams to the logger"""
+
+    def __init__(self, output_file, logger, src_filename):
+        self.output_file = output_file
+        self.logger = logger
+        self.src_filename = src_filename
+        self.first_write = True
+        self.logger_buffer = ''
+
+    def write(self, data):
+        self.output_file.write(data)
+
+        if self.first_write:
+            self.logger.verbose('Output from %s', self.src_filename,
+                                color='brown')
+            self.first_write = False
+
+        data = self.logger_buffer + data
+        lines = data.splitlines()
+        if data and data[-1] not in '\r\n':
+            # Wait to write last line if it's incomplete. It will write next
+            # time or when the LoggingTee is flushed.
+            self.logger_buffer = lines[-1]
+            lines = lines[:-1]
+        else:
+            self.logger_buffer = ''
+
+        for line in lines:
+            self.logger.verbose('%s', line)
+
+    def flush(self):
+        self.output_file.flush()
+        if self.logger_buffer:
+            self.logger.verbose('%s', self.logger_buffer)
+            self.logger_buffer = ''
+
+    # When called from a local terminal seaborn needs it in Python3
+    def isatty(self):
+        return self.output_file.isatty()
 
 
 class MixedEncodingStringIO(StringIO):
@@ -115,12 +161,12 @@ HLIST_IMAGE_TEMPLATE = """
     *
 
       .. image:: /%s
-            :scale: 47
+            :class: sphx-glr-multi-img
 """
 
 SINGLE_IMAGE = """
 .. image:: /%s
-    :align: center
+    :class: sphx-glr-single-img
 """
 
 
@@ -162,24 +208,31 @@ def extract_intro_and_title(filename, docstring):
     # lstrip is just in case docstring has a '\n\n' at the beginning
     paragraphs = docstring.lstrip().split('\n\n')
     # remove comments and other syntax like `.. _link:`
-    paragraphs = [p for p in paragraphs if not p.startswith('.. ')]
-    if len(paragraphs) <= 1:
+    paragraphs = [p for p in paragraphs
+                  if not p.startswith('.. ') and len(p) > 0]
+    if len(paragraphs) == 0:
         raise ValueError(
-            "Example docstring should have a header for the example title "
-            "and at least a paragraph explaining what the example is about. "
+            "Example docstring should have a header for the example title. "
             "Please check the example file:\n {}\n".format(filename))
     # Title is the first paragraph with any ReSTructuredText title chars
     # removed, i.e. lines that consist of (all the same) 7-bit non-ASCII chars.
     # This conditional is not perfect but should hopefully be good enough.
-    title = paragraphs[0].strip().split('\n')
-    title = ' '.join(t for t in title if len(t) > 0 and
-                     (ord(t[0]) >= 128 or t[0].isalnum()))
-    # Concatenate all lines of the first paragraph and truncate at 95 chars
-    first_paragraph = re.sub('\n', ' ', paragraphs[1])
-    first_paragraph = (first_paragraph[:95] + '...'
-                       if len(first_paragraph) > 95 else first_paragraph)
+    title_paragraph = paragraphs[0]
+    match = re.search(r'([\w ]+)', title_paragraph)
 
-    return first_paragraph, title
+    if match is None:
+        raise ValueError(
+            'Could not find a title in first paragraph:\n{}'.format(
+                         title_paragraph))
+    title = match.group(1).strip()
+    # Use the title if no other paragraphs are provided
+    intro_paragraph = title if len(paragraphs) < 2 else paragraphs[1]
+    # Concatenate all lines of the first paragraph and truncate at 95 chars
+    intro = re.sub('\n', ' ', intro_paragraph)
+    if len(intro) > 95:
+        intro = intro[:95] + '...'
+
+    return intro, title
 
 
 def get_md5sum(src_file):
@@ -337,14 +390,6 @@ def scale_image(in_fname, out_fname, max_width, max_height):
     thumb.paste(img, pos_insert)
 
     thumb.save(out_fname)
-    # Use optipng to perform lossless compression on the resized image if
-    # software is installed
-    if os.environ.get('SKLEARN_DOC_OPTIPNG', False):
-        try:
-            subprocess.call(["optipng", "-quiet", "-o", "9", out_fname])
-        except Exception:
-            logger.warning(
-                'Install optipng to reduce the size of the generated images')
 
 
 def save_thumbnail(image_path_template, src_file, file_conf, gallery_conf):
@@ -388,8 +433,15 @@ def generate_dir_rst(src_dir, target_dir, gallery_conf, seen_backrefs):
 
     if not os.path.exists(target_dir):
         os.makedirs(target_dir)
+    # get filenames
     listdir = [fname for fname in os.listdir(src_dir)
                if fname.endswith('.py')]
+    # limit which to look at based on regex (similar to filename_pattern)
+    listdir = [fname for fname in listdir
+               if re.search(gallery_conf['ignore_pattern'],
+                            os.path.normpath(os.path.join(src_dir, fname)))
+               is None]
+    # sort them
     sorted_listdir = sorted(
         listdir, key=gallery_conf['within_subsection_order'](src_dir))
     entries_text = []
@@ -456,7 +508,7 @@ def handle_exception(exc_info, src_file, block_vars, gallery_conf):
     return except_rst
 
 
-def execute_code_block(src_file, code_block, lineno, example_globals,
+def execute_code_block(compiler, src_file, code_block, lineno, example_globals,
                        block_vars, gallery_conf):
     """Executes the code block of the example file"""
     time_elapsed = 0
@@ -473,34 +525,42 @@ def execute_code_block(src_file, code_block, lineno, example_globals,
 
     # First cd in the original example dir, so that any file
     # created by the example get created in this directory
+
     my_stdout = MixedEncodingStringIO()
     os.chdir(os.path.dirname(src_file))
-    sys.stdout = my_stdout
+    sys.stdout = LoggingTee(my_stdout, logger, src_file)
 
     try:
-        code_ast = ast.parse(code_block, src_file)
+        dont_inherit = 1
+        code_ast = compile(code_block, src_file, 'exec',
+                           ast.PyCF_ONLY_AST | compiler.flags, dont_inherit)
         ast.increment_lineno(code_ast, lineno - 1)
         t_start = time()
         # don't use unicode_literals at the top of this file or you get
         # nasty errors here on Py2.7
-        exec(compile(code_ast, src_file, 'exec'), example_globals)
+        exec(compiler(code_ast, src_file, 'exec'), example_globals)
         time_elapsed = time() - t_start
-
     except Exception:
+        sys.stdout.flush()
         sys.stdout = orig_stdout
         except_rst = handle_exception(sys.exc_info(), src_file, block_vars,
                                       gallery_conf)
+        # python2.7: Code was read in bytes needs decoding to utf-8
+        # unless future unicode_literals is imported in source which
+        # make ast output unicode strings
+        if hasattr(except_rst, 'decode') and not isinstance(except_rst, unicode):
+            except_rst = except_rst.decode('utf-8')
+
         code_output = u"\n{0}\n\n\n\n".format(except_rst)
 
     else:
+        sys.stdout.flush()
         sys.stdout = orig_stdout
         os.chdir(cwd)
 
         my_stdout = my_stdout.getvalue().strip().expandtabs()
         if my_stdout:
             stdout = CODE_OUTPUT.format(indent(my_stdout, u' ' * 4))
-            logger.verbose('Output from %s', src_file, color='brown')
-            logger.verbose(my_stdout)
         else:
             stdout = ''
         images_rst, fig_num = save_figures(block_vars['image_path'],
@@ -545,7 +605,7 @@ def generate_file_rst(fname, target_dir, src_dir, gallery_conf):
     time_elapsed : float
         seconds required to run the script
     """
-
+    binder_conf = check_binder_conf(gallery_conf.get('binder'))
     src_file = os.path.normpath(os.path.join(src_dir, fname))
     example_file = os.path.join(target_dir, fname)
     shutil.copyfile(src_file, example_file)
@@ -561,7 +621,6 @@ def generate_file_rst(fname, target_dir, src_dir, gallery_conf):
 
     base_image_name = os.path.splitext(fname)[0]
     image_fname = 'sphx_glr_' + base_image_name + '_{0:03}.png'
-    build_image_dir = os.path.relpath(image_dir, gallery_conf['src_dir'])
     image_path_template = os.path.join(image_dir, image_fname)
 
     ref_fname = os.path.relpath(example_file, gallery_conf['src_dir'])
@@ -584,6 +643,7 @@ def generate_file_rst(fname, target_dir, src_dir, gallery_conf):
         '__name__': '__main__',
         # Don't ever support __file__: Issues #166 #212
     }
+    compiler = codeop.Compile()
 
     # A simple example has two blocks: one for the
     # example introduction/explanation and one for the code
@@ -602,7 +662,8 @@ def generate_file_rst(fname, target_dir, src_dir, gallery_conf):
 
     for blabel, bcontent, lineno in script_blocks:
         if blabel == 'code':
-            code_output, rtime = execute_code_block(src_file, bcontent, lineno,
+            code_output, rtime = execute_code_block(compiler, src_file,
+                                                    bcontent, lineno,
                                                     example_globals,
                                                     block_vars, gallery_conf)
 
@@ -638,15 +699,21 @@ def generate_file_rst(fname, target_dir, src_dir, gallery_conf):
 
     time_m, time_s = divmod(time_elapsed, 60)
     example_nb = jupyter_notebook(script_blocks)
-    save_notebook(example_nb, example_file.replace('.py', '.ipynb'))
+    save_notebook(example_nb, replace_py_ipynb(example_file))
     with codecs.open(os.path.join(target_dir, base_image_name + '.rst'),
                      mode='w', encoding='utf-8') as f:
         if time_elapsed >= gallery_conf["min_reported_time"]:
             example_rst += ("**Total running time of the script:**"
                             " ({0: .0f} minutes {1: .3f} seconds)\n\n".format(
                                 time_m, time_s))
+        # Generate a binder URL if specified
+        binder_badge_rst = ''
+        if len(binder_conf) > 0:
+            binder_badge_rst += gen_binder_rst(fname, binder_conf)
+
         example_rst += CODE_DOWNLOAD.format(fname,
-                                            fname.replace('.py', '.ipynb'))
+                                            replace_py_ipynb(fname),
+                                            binder_badge_rst)
         example_rst += SPHX_GLR_SIG
         f.write(example_rst)
 

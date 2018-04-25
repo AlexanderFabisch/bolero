@@ -16,7 +16,9 @@ CODE_DOWNLOAD = """
 \n.. only :: html
 
  .. container:: sphx-glr-footer
+    :class: sphx-glr-footer-example
 
+{2}
 \n  .. container:: sphx-glr-download
 
      :download:`Download Python source code: {0} <{0}>`\n
@@ -29,6 +31,7 @@ CODE_ZIP_DOWNLOAD = """
 \n.. only :: html
 
  .. container:: sphx-glr-footer
+    :class: sphx-glr-footer-gallery
 
 \n  .. container:: sphx-glr-download
 
