@@ -135,6 +135,20 @@ API
     </tr>
     </table>
 
+Applications
+------------
+
+BOLeRo has been used, for example, to test and learn walking behaviors
+for complex walking robots, create reference trajectories for grasping
+with whole-body control (`video <https://youtu.be/reHxPDtpv_E?t=1m48s>`_),
+adapt ball-throwing trajectories for a lightweight and dynamic robot,
+learn to pull a lever (`video <https://youtu.be/fG0srsYfmbA?t=2m25s>`_),
+and to learn how to grasp various objects from a table
+(`video <https://youtu.be/xhXZKRTWH3U?t=54s>`_). Most of the behaviors
+are learned in simulation and transferred to the real robot but BOLeRo
+has also been used to learn directly on real robots. It has been used
+in several research projects and theses.
+
 Funding
 -------
 
